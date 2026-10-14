@@ -31,9 +31,7 @@ contract RobinhoodForkTest is Test {
             at
         );
         RektJackpotHook hook = RektJackpotHook(at);
-        RektSwapRouter router = new RektSwapRouter(manager, hook);
-        vm.prank(CREATOR);
-        hook.configureRouter(address(router));
+        RektSwapRouter router = RektSwapRouter(hook.swapRouter());
         bool quoteFirst = IMD < address(token);
         PoolKey memory key = PoolKey(
             Currency.wrap(quoteFirst ? IMD : address(token)),

@@ -995,6 +995,19 @@
   },
   {
     "type": "function",
+    "name": "claimPayout",
+    "inputs": [
+      {
+        "name": "recipient",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
     "name": "configureRouter",
     "inputs": [
       {
@@ -1309,6 +1322,24 @@
   },
   {
     "type": "function",
+    "name": "redeemClaim",
+    "inputs": [
+      {
+        "name": "recipient",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "amount",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
     "name": "renounceOwnership",
     "inputs": [],
     "outputs": [],
@@ -1476,6 +1507,19 @@
   },
   {
     "type": "function",
+    "name": "totalUnclaimedPayouts",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "transferOwnership",
     "inputs": [
       {
@@ -1489,10 +1533,29 @@
   },
   {
     "type": "function",
-    "name": "unlockCallback",
+    "name": "unclaimedPayout",
     "inputs": [
       {
         "name": "",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "unlockCallback",
+    "inputs": [
+      {
+        "name": "data",
         "type": "bytes",
         "internalType": "bytes"
       }
@@ -1639,6 +1702,44 @@
   },
   {
     "type": "event",
+    "name": "PayoutClaimed",
+    "inputs": [
+      {
+        "name": "recipient",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "amount",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "PayoutParked",
+    "inputs": [
+      {
+        "name": "recipient",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "amount",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
     "name": "PoolBound",
     "inputs": [
       {
@@ -1771,12 +1872,22 @@
   },
   {
     "type": "error",
+    "name": "NothingToClaim",
+    "inputs": []
+  },
+  {
+    "type": "error",
     "name": "OnlyFactory",
     "inputs": []
   },
   {
     "type": "error",
     "name": "OnlyPoolManager",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "OnlySelf",
     "inputs": []
   },
   {
@@ -1824,16 +1935,6 @@
   {
     "type": "error",
     "name": "RoundStillActive",
-    "inputs": []
-  },
-  {
-    "type": "error",
-    "name": "RouterAlreadyConfigured",
-    "inputs": []
-  },
-  {
-    "type": "error",
-    "name": "RouterNotConfigured",
     "inputs": []
   },
   {

@@ -39,10 +39,10 @@ abstract contract HookFixture is Test {
     uint160 private deploymentNumber;
 
     function setUp() public virtual {
-        _deploy(true, true, true);
+        _deploy(true, true);
     }
 
-    function _deploy(bool quoteFirst, bool seed, bool configure) internal {
+    function _deploy(bool quoteFirst, bool seed) internal {
         ++deploymentNumber;
         vm.warp(1_000_000);
         alice = makeAddr("alice");
@@ -63,11 +63,8 @@ abstract contract HookFixture is Test {
             hookAddress
         );
         hook = RektJackpotHook(hookAddress);
-        router = new RektSwapRouter(manager, hook);
-        if (configure) {
-            vm.prank(owner);
-            hook.configureRouter(address(router));
-        }
+        // As the factory leaves it: the hook constructor deployed and bound its router, nothing else ran.
+        router = RektSwapRouter(hook.swapRouter());
         key = PoolKey({
             currency0: Currency.wrap(quoteFirst ? address(quote) : address(token)),
             currency1: Currency.wrap(quoteFirst ? address(token) : address(quote)),
@@ -113,7 +110,7 @@ abstract contract HookFixture is Test {
 
     function _assertConservation() internal view {
         uint256 claim = manager.balanceOf(address(hook), hook.quoteCurrency().toId());
-        assertEq(claim, hook.jackpotPool() + hook.pendingCreatorFees(), "claim backing");
+        assertEq(claim, hook.jackpotPool() + hook.pendingCreatorFees() + hook.totalUnclaimedPayouts(), "claim backing");
         assertEq(
             hook.totalFeesCollected(),
             hook.jackpotPool() + hook.totalCreatorFeesPaid() + hook.pendingCreatorFees() + hook.totalPrizesPaid()
@@ -123,8 +120,14 @@ abstract contract HookFixture is Test {
         assertEq(quote.balanceOf(address(hook)), 0, "hook must keep claims only");
         assertEq(quote.balanceOf(address(router)), 0, "no stranded router IMD");
         assertEq(token.balanceOf(address(router)), 0, "no stranded router REKTD");
-        assertEq(quote.balanceOf(owner), hook.totalCreatorFeesPaid(), "creator actually paid");
-        assertEq(quote.balanceOf(hook.BURN_RECIPIENT()), hook.totalIMDBurned(), "burn actually paid");
+        assertEq(
+            quote.balanceOf(owner) + hook.unclaimedPayout(owner), hook.totalCreatorFeesPaid(), "creator paid or parked"
+        );
+        assertEq(
+            quote.balanceOf(hook.BURN_RECIPIENT()) + hook.unclaimedPayout(hook.BURN_RECIPIENT()),
+            hook.totalIMDBurned(),
+            "burn paid or parked"
+        );
         assertEq(manager.currencyDelta(address(hook), key.currency0), 0);
         assertEq(manager.currencyDelta(address(hook), key.currency1), 0);
         assertEq(manager.currencyDelta(address(router), key.currency0), 0);

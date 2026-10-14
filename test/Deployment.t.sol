@@ -40,6 +40,12 @@ contract DeploymentTest is HookFixture {
         assertEq(fresh.factory(), emptyFactory);
         assertEq(fresh.launchToken(), emptyToken);
         Hooks.validateHookPermissions(IHooks(deployed), fresh.getHookPermissions());
+        // The router is live from the same creation code, with no second manifest entry or owner action.
+        RektSwapRouter bound = RektSwapRouter(fresh.swapRouter());
+        assertGt(address(bound).code.length, 0);
+        assertEq(address(bound.hook()), deployed);
+        assertEq(address(bound.poolManager()), address(emptyManager));
+        assertLe(creation.length, 49_152, "creation code over the EIP-3860 initcode limit");
     }
 
     function test_runtimeSizeAndNoEscapeOpcodes() public view {
@@ -88,8 +94,8 @@ contract DeploymentTest is HookFixture {
         assertTrue(fresh.initialized());
     }
 
-    function test_wrongRouterManagerOrHookRejected() public {
-        _deploy(true, true, false);
+    function test_routerReplacementAcceptsOnlyIdenticalRuntimeCode() public {
+        address original = hook.swapRouter();
         RektSwapRouter wrong = new RektSwapRouter(IPoolManager(makeAddr("other-manager")), hook);
         vm.prank(owner);
         vm.expectRevert(RektJackpotHook.InvalidRouter.selector);
@@ -98,6 +104,30 @@ contract DeploymentTest is HookFixture {
         vm.prank(owner);
         vm.expectRevert(RektJackpotHook.InvalidRouter.selector);
         hook.configureRouter(address(wrong));
+        vm.prank(owner);
+        vm.expectRevert(RektJackpotHook.InvalidRouter.selector);
+        hook.configureRouter(alice);
+        vm.prank(owner);
+        vm.expectRevert(RektJackpotHook.InvalidRouter.selector);
+        hook.configureRouter(original);
+        RektSwapRouter copy = new RektSwapRouter(manager, hook);
+        vm.prank(alice);
+        vm.expectRevert();
+        hook.configureRouter(address(copy));
+        assertEq(hook.swapRouter(), original);
+        vm.prank(owner);
+        hook.configureRouter(address(copy));
+        assertEq(hook.swapRouter(), address(copy));
+        // The replaced router is no longer accepted; the identical copy trades normally.
+        vm.startPrank(alice);
+        quote.approve(original, 10 ether);
+        vm.expectRevert();
+        RektSwapRouter(original).swap(true, -10 ether, 1, _priceLimit(true), block.timestamp);
+        vm.stopPrank();
+        router = copy;
+        _buy(alice, 10 ether);
+        assertEq(hook.currentLeader(), alice);
+        _assertConservation();
     }
 
     function test_twoStepOwnershipDoesNotRedirectCreatorFees() public {

@@ -1,6 +1,6 @@
 # REKTD Blitz contracts
 
-This is the contract-stage contribution for REKTD on Robinhood Chain (4663): a fixed-supply token, an IMD-denominated last-buyer jackpot hook, a dedicated swap router, tests, and ABI exports. The dashboard/IPFS publication and independently authored `launch.json` belong to subsequent stages. Nothing here broadcasts transactions or requires a private key, oracle, keeper, backend signer, or other outside service.
+This is the contract-stage contribution for REKTD on Robinhood Chain (4663): a fixed-supply token, an IMD-denominated last-buyer jackpot hook, a dedicated swap router the hook deploys itself, tests, and ABI exports. The dashboard/IPFS publication and independently authored `launch.json` belong to subsequent stages. Nothing here broadcasts transactions or requires a private key, oracle, keeper, backend signer, or other outside service.
 
 ## Build and test
 
@@ -28,8 +28,8 @@ It passed using the real IMD token, a fresh locally deployed PoolManager, REKTD-
 | Contract | Constructor, in order | Purpose |
 |---|---|---|
 | `RektToken` | None | REKTD / REKTD, 18 decimals, exactly `1000000000000000000000000000` units minted once to its deployer (the launch factory). |
-| `RektJackpotHook` | `IPoolManager manager`, `address initialOwner`, `address launchFactory`, `address pairedToken`, `address token` | One-pool fee accounting, authenticated leader tracking, timer, round settlement and history. |
-| `RektSwapRouter` | `IPoolManager manager`, `RektJackpotHook jackpotHook` | Pulls only the caller's input, executes one swap, enforces slippage/deadline, pays creator fees, and refunds unused input. |
+| `RektJackpotHook` | `IPoolManager manager`, `address initialOwner`, `address launchFactory`, `address pairedToken`, `address token` | One-pool fee accounting, authenticated leader tracking, timer, round settlement and history. Its constructor also deploys and binds `RektSwapRouter`. |
+| `RektSwapRouter` | `IPoolManager manager`, `RektJackpotHook jackpotHook` | Deployed by the hook constructor, never by the manifest. Pulls only the caller's input, executes one swap, enforces slippage/deadline, pays creator fees, and refunds unused input. |
 
 Hook constructor resolution for the manifest contribution:
 
@@ -41,7 +41,7 @@ Hook constructor resolution for the manifest contribution:
 | `pairedToken` | IMD: `0x5F7Bb59365ce557C26dbcAa4EE9d39A4b95B7127` on chain 4663, 18 decimals. |
 | `token` | `$token`, the freshly deployed `RektToken`. |
 
-Deploy the router with the same resolved PoolManager and the deployed hook address. All constructors are free of external calls and code-existence checks. The hook constructor checks its own permission bits. All library calls are internal/inlined, with no bytecode link references. All three runtime sizes are below EIP-170.
+The manifest names only `RektToken` and `RektJackpotHook`. The hook constructor runs `new RektSwapRouter(manager, this)` itself, so the router's creation code is part of the hook's attested creation code, the router exists at the end of the launch transaction, and `swapRouter()` is never zero: the pool trades as soon as the factory seeds it, with no owner action. Read the router's address from `swapRouter()` or the `SwapRouterConfigured` event in the hook's deployment receipt. All constructors are free of external calls and code-existence checks (creating a new contract is not a call to an existing one, and the launch simulation with empty manager/factory/token addresses is in `test/Deployment.t.sol`). The hook constructor checks its own permission bits. All library calls are internal/inlined, with no bytecode link references. All three runtime sizes are below EIP-170 and the hook's creation code (14,473 bytes, router included) is below the 49,152-byte initcode limit.
 
 The hook's lower 14 address bits must be **`0x20cc` (8396)**. Mine CREATE2 using the actual deployer, complete compiled creation bytecode and encoded constructor arguments. The enabled callbacks are `beforeInitialize`, `beforeSwap`, and `afterSwap`, plus both swap return-delta permissions. Permission flags are immutable. A real CREATE2 deployment is exercised in `test/Deployment.t.sol`.
 
@@ -71,9 +71,10 @@ The hook mints IMD ERC-6909 claims on the PoolManager for the fee. The router th
 At transaction boundaries:
 
 ```text
-hook IMD claims = jackpotPool + pendingCreatorFees
+hook IMD claims = jackpotPool + pendingCreatorFees + totalUnclaimedPayouts
 pendingCreatorFees = 0
 totalFeesCollected = jackpotPool + totalCreatorFeesPaid + totalPrizesPaid + totalIMDBurned
+totalCreatorFeesPaid, totalPrizesPaid, totalIMDBurned count IMD allocated: delivered or parked
 every PoolManager transient delta = 0
 ```
 
@@ -84,7 +85,7 @@ Partial execution is supported for exact-input **sells**, charged on actual IMD 
 This is a deterministic last-qualifying-buyer game, not a random lottery. There is no oracle, random seed, or promised resistance to transaction ordering.
 
 1. Before a swap, an expired active round is settled using only its existing pot. The new swap's fee belongs to the next round.
-2. Eligibility is evaluated against the pot **before that swap adds its fee**, after any expiry settlement: `max(1e18, ceil(jackpotPool / 20))` IMD minor units. This is the 1 IMD floor or 5% of the pot. The actual gross IMD spent must meet this ticket, and the buyer must receive nonzero REKTD.
+2. Eligibility is evaluated against the pot **before that swap adds its fee**, after any expiry settlement: `max(1e18, ceil(pot / 20))` IMD minor units, where `pot` is `jackpotPool`, or its 20% rollover while `canSettle()` is true. This is the 1 IMD floor or 5% of the pot. `minimumTicket()` applies the same rule, so the view always equals what the next buy must spend, including in the window between a round's expiry and its settlement. The actual gross IMD spent must meet this ticket, and the buyer must receive nonzero REKTD.
 3. The first qualifying buy starts a 600-second timer and sets the caller of the dedicated router as leader. Later qualifying buys replace the leader and set `roundEndTime = min(oldEnd + 120, now + 600)`. Multiple buys in one block cannot exceed the cap. Sells and sub-ticket buys fund the pot but do not extend the timer or become leader.
 4. At `timestamp == roundEndTime`, a qualifying buy is still valid; expiry is strictly **`timestamp > roundEndTime`**, as in the approved brief. A displayed countdown of zero can therefore need the next second before settlement is callable.
 5. Once expired, anyone calls `settleRound()`, or the next swap settles automatically. The last leader receives `floor(pot * 6000 / 10000)` IMD; `floor(pot * 2000 / 10000)` is transferred to `0x000000000000000000000000000000000000dEaD`; the remainder stays as rollover (20% plus rounding dust).
@@ -92,22 +93,30 @@ This is a deterministic last-qualifying-buyer game, not a random lottery. There 
 
 Burning means the specified permanent sink transfer; it does not call an IMD mint/burn administrator or reduce IMD's `totalSupply`. Direct token transfers to the hook/router do not enter the pot and have no rescue mechanism. Fund the jackpot by trading in its bound pool.
 
-All transfers and accounting changes are atomic. If a creator, winner or burn transfer is refused by IMD, the entire operation reverts, preserving the previous pot and leader. A creator-transfer failure rejects the swap; a winner/burn failure prevents settlement and swaps that would auto-settle. Retry only once IMD allows the transfer. The hook has no power to bypass token restrictions or choose an alternative winner. Standard ERC-20 transfers do not invoke recipient callbacks, so a recipient contract rejecting ETH does not affect this IMD-only design.
+### Payouts IMD refuses
+
+IMD on Robinhood Chain is not a plain ERC-20: it has an owner-controlled blocklist (`blocked(address)`), so a winner, the burn sink or the creator can be refused at any time. A payout therefore never sits in the trading or settlement path. Every creator, winner and burn payment first tries the direct transfer (`redeemClaim`, a self-call the hook makes inside `try`/`catch`; it reverts `OnlySelf` for anyone else). If IMD refuses it, the amount stays backed by the hook's ERC-6909 claim and is recorded in `unclaimedPayout(recipient)` and `totalUnclaimedPayouts`, with a `PayoutParked` event. Round accounting is unchanged: the round still closes, the leader and timer clear, the rollover stays in the pot, the swap that triggered settlement still executes, and the next round starts normally. **No refusal by IMD can freeze settlement or trading.**
+
+`claimPayout(address recipient)` is permissionless: anyone may retry delivery of a parked amount to its fixed recipient (needed for the burn sink, which cannot call anything). It burns the claim and transfers the IMD, emits `PayoutClaimed`, and reverts `NothingToClaim` when nothing is parked or with IMD's own error while the recipient is still refused, changing nothing. Parked amounts accumulate per recipient across rounds and are included in the claim-backing invariant above. The hook has no power to bypass token restrictions, redirect a payout or choose an alternative winner. A settlement call sent with just too little gas can also land in the parked path (the inner transfer runs out of gas); that costs the recipient one `claimPayout` later, nothing more. Standard ERC-20 transfers do not invoke recipient callbacks, so a recipient contract rejecting ETH does not affect this IMD-only design.
 
 ## After launch
 
-The sole required owner action is **`RektJackpotHook.configureRouter(address)`**, called by `initialOwner` (or its accepted successor) with the address of the delivered `RektSwapRouter` from the service's deployment records. Verify its source/bytecode, hook and PoolManager first. This setter emits `SwapRouterConfigured` and works **once**. It checks the router's hook and manager; owner review of its actual code is still required. All swaps revert `RouterNotConfigured` until it is set. Once bound, neither the owner nor factory can replace it, pause swaps, change fees/timers/recipients, or withdraw the pot.
+**No owner action is required for trading.** The launch transaction deploys the token and the hook, and the hook constructor deploys and binds its own `RektSwapRouter`; `swapRouter()` is set from the first block. There are no settings or missing deployment values for the requester to supply.
 
-Only the configured router can swap in this pool. This deliberate restriction authenticates the payer as the jackpot buyer and guarantees same-transaction creator payment. Generic Universal Routers, arbitrary hook data, and standard swap quoters are not supported directly. Contracts and smart-account wallets can use `RektSwapRouter` normally: attribution uses their immediate call, never `tx.origin`.
+Only the bound router can swap in this pool. This deliberate restriction authenticates the payer as the jackpot buyer and guarantees same-transaction creator payment. Generic Universal Routers, arbitrary hook data, and standard swap quoters are not supported directly. Contracts and smart-account wallets can use `RektSwapRouter` normally: attribution uses their immediate call, never `tx.origin`. A second router deployed from the same source is not accepted until the owner binds it.
 
-Ownership uses two-step transfer, but changing owner does not change the original creator recipient. Renouncing ownership is disabled. Ownership after binding has no economic controls. There are no other settings or missing deployment values for the requester to supply.
+The one owner power over routing is **`configureRouter(address)`**, kept as a recovery path: the router briefly holds each buyer's IMD, so if IMD's owner ever blocklists the router's address every buy would fail. The owner may then deploy a fresh `RektSwapRouter(manager, hook)` and bind it. The hook accepts a replacement only if its runtime code hash equals the constructor-deployed router's (`router.codehash == swapRouter.codehash`). Immutables are part of runtime code, so an accepted router necessarily runs the reviewed logic against this PoolManager and this hook; a different build, a different target or any other contract is rejected `InvalidRouter`, as is rebinding the current router. The replaced router stops being accepted, and `SwapRouterConfigured` records the change. The owner cannot otherwise pause swaps, change fees/timers/recipients, or withdraw the pot.
 
-Services remain responsible for the independently generated manifest, source publication, attestation, admission, launch-factory execution, actual allocation/LP policy and final deployment rehearsal. The owner configures the router after deployment. The frontend stage uses the ABI exports and [integration guide](docs/abi/README.md), displays the game/ordering risks, and publishes the approved dashboard. Anyone may settle an expired round; no automated offchain keeper is required. Independent adversarial review remains a separate stage.
+Ownership uses two-step transfer, but changing owner does not change the original creator recipient. Renouncing ownership is disabled.
+
+Services remain responsible for the independently generated manifest, source publication, attestation, admission, launch-factory execution, actual allocation/LP policy and final deployment rehearsal. The frontend stage uses the ABI exports and [integration guide](docs/abi/README.md), reads `swapRouter()` from the hook rather than a separately recorded address, displays the game/ordering risks, and publishes the approved dashboard. Anyone may settle an expired round or retry a parked payout; no automated offchain keeper is required. Independent adversarial review remains a separate stage.
 
 ## Implementation choices and risks
 
 - [Canonical hook configuration](docs/hook-config.json): a BaseHook-style implementation on core `IHooks`; ownable, no shares, no pause. Explicit bounded casts replace a cast utility; direct claim mint/burn/take operations replace CurrencySettler. The hook does not add transient storage, while v4-core requires Cancun transient storage.
 - All economics are named constants: `HOOK_FEE_BPS=100`, `CREATOR_FEE_BPS=50`, `TICKET_BPS=500`, `WINNER_BPS=6000`, `BURN_BPS=2000`, `ROUND_DURATION=600`, `EXTENSION=120`, `MIN_TICKET=1e18`, `LP_FEE=12500`, `TICK_SPACING=60`.
-- IMD must remain a standard non-rebasing, non-taxed 18-decimal ERC-20 allowing the required transfers. The router rejects taxed incoming transfers. The pinned fork tested the actual token's relevant transfer paths; it cannot guarantee future token behavior.
+- IMD must remain a non-rebasing, non-taxed 18-decimal ERC-20. The router rejects taxed incoming transfers. Blocklisted recipients are handled by parking (above); a blocklisted router address is handled by `configureRouter`; a blocklisted *buyer* simply cannot sell, as with any IMD holder. The pinned fork tested the actual token's relevant transfer paths; it cannot guarantee future token behavior.
+- The creator fee recipient is `initialOwner`, which the manifest writes as `$owner`. The brief names the creator as `0x08cD4437B077928E7fA09CF7dcDf3F7624743Bd2`, the same wallet that pays for and owns the launch, so `$owner` resolves to it; the manifest review must confirm that resolution because the recipient is immutable and `transferOwnership` does not move it.
+- The 1% hook fee rounds down (`floor`), so gross IMD volume below 100 wei pays no fee and each swap under-collects by at most 1 wei. Splits conserve value exactly and a zero-fee swap cannot take leadership (1 IMD floor), so nothing is exploitable; this is the documented rounding, not a defect.
 - Bots, profitable last-second entries, self-trading, wash volume, sequencer timing/censorship and transaction ordering can affect leadership. A last buyer may lose the lead before their transaction confirms. Slippage/deadline controls protect trade execution, not winning odds. No minimum guaranteed jackpot payout or refund of swap fees is promised.
-- No proxy, upgrade, administrative pot withdrawal, or external-call loop exists. Immutable code cannot be repaired in place after launch; the reviewed router must be bound correctly.
+- No proxy, upgrade, administrative pot withdrawal, or external-call loop exists. Immutable code cannot be repaired in place after launch; the only replaceable part is the router, and only by a bytecode-identical copy.

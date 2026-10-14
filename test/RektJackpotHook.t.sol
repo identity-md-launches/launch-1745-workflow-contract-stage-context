@@ -70,7 +70,7 @@ contract RektJackpotHookTest is HookFixture {
     }
 
     function test_allFourSwapModesWithIMDAsCurrencyOne() public {
-        _deploy(false, true, true);
+        _deploy(false, true);
         _buy(alice, 100 ether);
         assertEq(hook.totalFeesCollected(), 1 ether);
         (, uint256 received) = _sell(bob, 50 ether);
@@ -86,7 +86,7 @@ contract RektJackpotHookTest is HookFixture {
     }
 
     function test_freshTokenOnlyPoolPaysImmediatelyWithoutNativeBalance() public {
-        _deploy(true, false, true);
+        _deploy(true, false);
         // With quote as currency0, liquidity below the current price is REKTD only.
         factory.modify(key, -600, 0, int256(LIQUIDITY));
         assertEq(quote.balanceOf(address(manager)), 0);
@@ -99,7 +99,7 @@ contract RektJackpotHookTest is HookFixture {
     }
 
     function test_freshTokenOnlyPoolWithIMDAsCurrencyOne() public {
-        _deploy(false, false, true);
+        _deploy(false, false);
         factory.modify(key, 0, 600, int256(LIQUIDITY));
         assertEq(quote.balanceOf(address(manager)), 0);
         _trade(alice, true, 10 ether, 20 ether, _priceLimit(true));
@@ -238,6 +238,11 @@ contract RektJackpotHookTest is HookFixture {
         hook.unlockCallback("");
         vm.expectRevert(RektJackpotHook.OnlySwapRouter.selector);
         hook.payCreatorFee();
+        vm.expectRevert(RektJackpotHook.OnlySelf.selector);
+        hook.redeemClaim(alice, 1);
+        vm.prank(address(manager));
+        vm.expectRevert(RektJackpotHook.OnlySelf.selector);
+        hook.redeemClaim(alice, 1);
     }
 
     function test_poolInitializationCannotBeHijackedOrReused() public {
@@ -269,57 +274,155 @@ contract RektJackpotHookTest is HookFixture {
         vm.stopPrank();
     }
 
-    function test_routerUnsetThenConfiguredOnlyByOwnerOnlyOnce() public {
-        _deploy(true, true, false);
-        vm.prank(address(manager));
-        vm.expectRevert(RektJackpotHook.RouterNotConfigured.selector);
-        hook.beforeSwap(address(router), key, SwapParams(true, -1 ether, _priceLimit(true)), abi.encode(alice));
-        vm.prank(alice);
+    function test_routerIsBoundByTheConstructorAndCopiesAreNotAccepted() public {
+        assertTrue(hook.swapRouter() != address(0));
+        assertEq(hook.swapRouter(), address(router));
+        assertEq(address(router.hook()), address(hook));
+        assertEq(address(router.poolManager()), address(manager));
+        // A bytecode-identical router that the owner did not bind is still not this pool's router.
+        RektSwapRouter copy = new RektSwapRouter(manager, hook);
+        assertEq(address(copy).codehash, address(router).codehash);
+        vm.startPrank(alice);
+        quote.approve(address(copy), 10 ether);
         vm.expectRevert();
-        hook.configureRouter(address(router));
-        vm.startPrank(owner);
-        vm.expectRevert(RektJackpotHook.InvalidRouter.selector);
-        hook.configureRouter(alice);
-        hook.configureRouter(address(router));
-        vm.expectRevert(RektJackpotHook.RouterAlreadyConfigured.selector);
-        hook.configureRouter(address(router));
+        copy.swap(true, -10 ether, 1, _priceLimit(true), block.timestamp);
         vm.stopPrank();
+        vm.prank(address(copy));
+        vm.expectRevert(RektJackpotHook.OnlySwapRouter.selector);
+        hook.payCreatorFee();
         _buy(alice, 10 ether);
+        assertEq(hook.currentLeader(), alice);
         _assertConservation();
     }
 
-    function test_failedWinnerOrBurnTransferRollsBackEntireSettlement() public {
+    function test_minimumTicketReflectsTheSettlementTheNextSwapPerformsFirst() public {
+        for (uint256 i; i < 20; ++i) {
+            _buy(alice, 10_000 ether);
+        }
+        assertEq(hook.jackpotPool(), 1_000 ether);
+        assertEq(hook.minimumTicket(), 50 ether);
+        vm.warp(hook.roundEndTime() + 1);
+        assertTrue(hook.canSettle());
+        // The next buy is judged against the rollover (20% of the pot), so the view says so.
+        assertEq(hook.minimumTicket(), 10 ether);
+        _buy(bob, 10 ether - 1);
+        assertEq(hook.roundId(), 2);
+        assertEq(hook.currentLeader(), address(0));
+        assertEq(hook.minimumTicket(), (hook.jackpotPool() + 19) / 20);
+        _buy(bob, hook.minimumTicket());
+        assertEq(hook.currentLeader(), bob);
+        _assertConservation();
+    }
+
+    function test_blockedWinnerIsParkedAndTradingContinues() public {
         _buy(alice, 100 ether);
         vm.warp(hook.roundEndTime() + 1);
         quote.blockRecipient(alice);
-        vm.expectRevert();
-        hook.settleRound();
-        assertEq(hook.roundId(), 1);
-        assertEq(hook.currentLeader(), alice);
-        assertEq(hook.jackpotPool(), 0.5 ether);
+        uint256 aliceBefore = quote.balanceOf(alice);
+        vm.startPrank(bob);
+        quote.approve(address(router), 100 ether);
+        vm.expectEmit(true, false, false, true, address(hook));
+        emit RektJackpotHook.PayoutParked(alice, 0.3 ether);
+        (uint256 spent, uint256 received) = router.swap(true, -100 ether, 1, _priceLimit(true), block.timestamp);
+        vm.stopPrank();
+        assertEq(spent, 100 ether);
+        assertGt(received, 0);
+        assertEq(hook.roundId(), 2);
+        assertEq(hook.currentLeader(), bob);
+        assertEq(hook.jackpotPool(), 0.6 ether);
+        assertEq(hook.totalPrizesPaid(), 0.3 ether);
+        assertEq(hook.totalIMDBurned(), 0.1 ether);
+        assertEq(quote.balanceOf(hook.BURN_RECIPIENT()), 0.1 ether, "burn still paid directly");
+        assertEq(hook.unclaimedPayout(alice), 0.3 ether);
+        assertEq(hook.totalUnclaimedPayouts(), 0.3 ether);
+        assertEq(quote.balanceOf(alice), aliceBefore);
         _assertConservation();
-        quote.blockRecipient(hook.BURN_RECIPIENT());
-        uint256 balance = quote.balanceOf(alice);
+        // Still refused: the retry reverts and changes nothing.
         vm.expectRevert();
-        hook.settleRound();
-        assertEq(quote.balanceOf(alice), balance, "winner payment must roll back when burn fails");
-        assertEq(hook.roundId(), 1);
+        hook.claimPayout(alice);
+        assertEq(hook.unclaimedPayout(alice), 0.3 ether);
+        // The blocked address can still buy (it receives REKTD) and others can sell; nothing is frozen.
+        _buy(alice, 10 ether);
+        assertEq(hook.currentLeader(), alice);
+        _sell(bob, 1 ether);
+        _assertConservation();
+        // Once IMD allows it, anyone pays the parked prize out to alice, exactly once.
         quote.blockRecipient(address(0));
-        hook.settleRound();
+        aliceBefore = quote.balanceOf(alice);
+        vm.expectEmit(true, false, false, true, address(hook));
+        emit RektJackpotHook.PayoutClaimed(alice, 0.3 ether);
+        vm.prank(bob);
+        hook.claimPayout(alice);
+        assertEq(quote.balanceOf(alice) - aliceBefore, 0.3 ether);
+        assertEq(hook.unclaimedPayout(alice), 0);
+        assertEq(hook.totalUnclaimedPayouts(), 0);
+        vm.expectRevert(RektJackpotHook.NothingToClaim.selector);
+        hook.claimPayout(alice);
+        vm.expectRevert(RektJackpotHook.NothingToClaim.selector);
+        hook.claimPayout(bob);
         _assertConservation();
     }
 
-    function test_failedCreatorPaymentRollsBackSwapAndLeadership() public {
-        quote.blockRecipient(owner);
-        uint256 balance = quote.balanceOf(alice);
-        vm.startPrank(alice);
-        quote.approve(address(router), 100 ether);
-        vm.expectRevert();
-        router.swap(true, -100 ether, 1, _priceLimit(true), block.timestamp);
-        vm.stopPrank();
-        assertEq(quote.balanceOf(alice), balance);
+    function test_blockedBurnSinkIsParkedAndSettlementStillCloses() public {
+        _buy(alice, 100 ether);
+        vm.warp(hook.roundEndTime() + 1);
+        quote.blockRecipient(hook.BURN_RECIPIENT());
+        uint256 aliceBefore = quote.balanceOf(alice);
+        hook.settleRound();
+        assertEq(quote.balanceOf(alice) - aliceBefore, 0.3 ether, "winner paid directly");
+        assertEq(hook.roundId(), 2);
         assertEq(hook.currentLeader(), address(0));
-        assertEq(hook.totalFeesCollected(), 0);
+        assertEq(hook.unclaimedPayout(hook.BURN_RECIPIENT()), 0.1 ether);
+        assertEq(quote.balanceOf(hook.BURN_RECIPIENT()), 0);
+        _assertConservation();
+        quote.blockRecipient(address(0));
+        hook.claimPayout(hook.BURN_RECIPIENT());
+        assertEq(quote.balanceOf(hook.BURN_RECIPIENT()), 0.1 ether);
+        assertEq(hook.unclaimedPayout(hook.BURN_RECIPIENT()), 0);
+        _assertConservation();
+    }
+
+    function test_blockedCreatorIsParkedAndSwapsStillSucceed() public {
+        quote.blockRecipient(owner);
+        (uint256 spent,) = _buy(alice, 100 ether);
+        assertEq(spent, 100 ether);
+        assertEq(hook.currentLeader(), alice);
+        assertEq(hook.totalFeesCollected(), 1 ether);
+        assertEq(hook.totalCreatorFeesPaid(), 0.5 ether);
+        assertEq(hook.pendingCreatorFees(), 0);
+        assertEq(hook.unclaimedPayout(owner), 0.5 ether);
+        assertEq(quote.balanceOf(owner), 0);
+        _assertConservation();
+        _buy(bob, 100 ether);
+        assertEq(hook.unclaimedPayout(owner), 1 ether);
+        _assertConservation();
+        quote.blockRecipient(address(0));
+        hook.claimPayout(owner);
+        assertEq(quote.balanceOf(owner), 1 ether);
+        _buy(alice, 100 ether);
+        assertEq(quote.balanceOf(owner), 1.5 ether, "direct payment resumes once allowed");
+        assertEq(hook.unclaimedPayout(owner), 0);
+        _assertConservation();
+    }
+
+    function test_parkedPayoutsAccumulateAcrossRoundsAndAreBackedByClaims() public {
+        quote.blockRecipient(alice);
+        _buy(alice, 100 ether);
+        vm.warp(hook.roundEndTime() + 1);
+        hook.settleRound();
+        _buy(alice, 100 ether);
+        vm.warp(hook.roundEndTime() + 1);
+        hook.settleRound();
+        assertEq(hook.roundId(), 3);
+        assertEq(hook.unclaimedPayout(alice), hook.totalPrizesPaid());
+        assertEq(
+            manager.balanceOf(address(hook), hook.quoteCurrency().toId()), hook.jackpotPool() + hook.totalPrizesPaid()
+        );
+        _assertConservation();
+        quote.blockRecipient(address(0));
+        uint256 before = quote.balanceOf(alice);
+        hook.claimPayout(alice);
+        assertEq(quote.balanceOf(alice) - before, hook.totalPrizesPaid());
         _assertConservation();
     }
 

@@ -15,11 +15,12 @@ import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {BeforeSwapDelta, toBeforeSwapDelta} from "v4-core/src/types/BeforeSwapDelta.sol";
 import {CheckedHook} from "./base/CheckedHook.sol";
-import {IRektSwapRouter} from "./interfaces/IRektSwapRouter.sol";
+import {RektSwapRouter} from "./RektSwapRouter.sol";
 
 /// @notice A last-buyer blitz jackpot, denominated and paid entirely in IMD.
-/// @dev Only the one-time configured router may trade: it authenticates buyers and pays creator fees
-/// after settling input, including on a manager initially seeded with REKTD only.
+/// @dev Only the router this constructor deploys may trade: it authenticates buyers and pays creator
+/// fees after settling input, including on a manager initially seeded with REKTD only. A payout that
+/// IMD refuses is parked as a claimable balance so settlement and trading never depend on it.
 contract RektJackpotHook is CheckedHook, Ownable2Step, ReentrancyGuard, IUnlockCallback {
     using PoolIdLibrary for PoolKey;
 
@@ -27,15 +28,15 @@ contract RektJackpotHook is CheckedHook, Ownable2Step, ReentrancyGuard, IUnlockC
     error InvalidPool();
     error AlreadyInitialized();
     error NotInitialized();
-    error RouterNotConfigured();
-    error RouterAlreadyConfigured();
     error OnlySwapRouter();
     error InvalidRouter();
+    error OnlySelf();
     error InvalidBuyer();
     error InvalidSwapAmount();
     error PartialFillUnsupported();
     error NoActiveRound();
     error RoundStillActive();
+    error NothingToClaim();
     error UnexpectedUnlock();
     error RenounceDisabled();
 
@@ -56,6 +57,8 @@ contract RektJackpotHook is CheckedHook, Ownable2Step, ReentrancyGuard, IUnlockC
     address public immutable launchToken;
     Currency public immutable quoteCurrency;
     address public immutable creatorFeeRecipient;
+    /// @notice The only contract that may swap in this pool. Deployed by the constructor; the owner may
+    /// only ever replace it with a bytecode-identical copy (same code, same manager, same hook).
     address public swapRouter;
     bool public initialized;
     bool private unlocking;
@@ -71,6 +74,9 @@ contract RektJackpotHook is CheckedHook, Ownable2Step, ReentrancyGuard, IUnlockC
     uint256 public totalCreatorFeesPaid;
     uint256 public totalFeesCollected;
     uint256 public pendingCreatorFees;
+    /// @notice IMD allocated to a recipient that refused the direct transfer, still backed by claims.
+    mapping(address => uint256) public unclaimedPayout;
+    uint256 public totalUnclaimedPayouts;
 
     struct RoundResult {
         address winner;
@@ -88,6 +94,8 @@ contract RektJackpotHook is CheckedHook, Ownable2Step, ReentrancyGuard, IUnlockC
     event SwapRouterConfigured(address indexed router);
     event HookFeeCollected(address indexed buyer, bool isBuy, uint256 grossQuote, uint256 creator, uint256 jackpot);
     event CreatorFeePaid(address indexed recipient, uint256 amount);
+    event PayoutParked(address indexed recipient, uint256 amount);
+    event PayoutClaimed(address indexed recipient, uint256 amount);
     event LeaderChanged(
         uint256 indexed roundId, address indexed leader, uint256 quoteSpent, uint256 ticket, uint256 endTime
     );
@@ -120,6 +128,11 @@ contract RektJackpotHook is CheckedHook, Ownable2Step, ReentrancyGuard, IUnlockC
         quoteCurrency = Currency.wrap(pairedToken);
         creatorFeeRecipient = initialOwner;
         Hooks.validateHookPermissions(IHooks(address(this)), getHookPermissions());
+        // The router is part of this creation code, so the launch transaction yields a tradeable pool
+        // and no later owner action can bind different routing code.
+        address router = address(new RektSwapRouter(manager, this));
+        swapRouter = router;
+        emit SwapRouterConfigured(router);
     }
 
     function getHookPermissions() public pure returns (Hooks.Permissions memory p) {
@@ -130,14 +143,13 @@ contract RektJackpotHook is CheckedHook, Ownable2Step, ReentrancyGuard, IUnlockC
         p.afterSwapReturnDelta = true;
     }
 
-    /// @notice Bind the reviewed router once. Ownership cannot later change routing or economics.
+    /// @notice Replace the router with a copy whose runtime code is identical to the one this constructor
+    /// deployed. Immutables are part of that code, so the copy necessarily targets this manager and hook
+    /// and runs the reviewed logic; no other contract is accepted. Recovery path for a router address
+    /// that IMD later refuses to serve. The previous router stops being accepted.
     function configureRouter(address router) external onlyOwner {
-        if (swapRouter != address(0)) revert RouterAlreadyConfigured();
-        if (router.code.length == 0) revert InvalidRouter();
-        if (
-            IRektSwapRouter(router).poolManager() != address(poolManager)
-                || IRektSwapRouter(router).hook() != address(this)
-        ) revert InvalidRouter();
+        address current = swapRouter;
+        if (router == current || router.codehash != current.codehash) revert InvalidRouter();
         swapRouter = router;
         emit SwapRouterConfigured(router);
     }
@@ -151,9 +163,12 @@ contract RektJackpotHook is CheckedHook, Ownable2Step, ReentrancyGuard, IUnlockC
         return key;
     }
 
-    /// @notice Ticket for the current pot, before the next swap adds its fee. Rounded up to a wei.
+    /// @notice Ticket the next buy must meet, before that swap adds its fee. Rounded up to a wei.
+    /// @dev An expired round is settled before the next swap is judged, so the pot used is the rollover.
     function minimumTicket() public view returns (uint256) {
-        uint256 proportional = jackpotPool / 20 + (jackpotPool % 20 == 0 ? 0 : 1);
+        uint256 pot = jackpotPool;
+        if (canSettle()) pot = pot - pot * WINNER_BPS / BPS - pot * BURN_BPS / BPS;
+        uint256 proportional = pot / 20 + (pot % 20 == 0 ? 0 : 1);
         return proportional > MIN_TICKET ? proportional : MIN_TICKET;
     }
 
@@ -259,7 +274,7 @@ contract RektJackpotHook is CheckedHook, Ownable2Step, ReentrancyGuard, IUnlockC
 
     /// @notice Called by the router after it settles input, before the same unlock finishes.
     function payCreatorFee() external nonReentrant {
-        if (msg.sender != swapRouter || swapRouter == address(0)) revert OnlySwapRouter();
+        if (msg.sender != swapRouter) revert OnlySwapRouter();
         uint256 amount = pendingCreatorFees;
         if (amount == 0) return;
         pendingCreatorFees = 0;
@@ -272,16 +287,48 @@ contract RektJackpotHook is CheckedHook, Ownable2Step, ReentrancyGuard, IUnlockC
     function settleRound() external nonReentrant {
         if (currentLeader == address(0)) revert NoActiveRound();
         if (block.timestamp <= roundEndTime) revert RoundStillActive();
-        unlocking = true;
-        bytes memory result = poolManager.unlock("");
-        if (unlocking || result.length != 0) revert UnexpectedUnlock();
+        _unlock("");
     }
 
-    function unlockCallback(bytes calldata) external onlyPoolManager returns (bytes memory) {
+    /// @notice Pay out IMD parked for a recipient that refused it earlier. Anyone may retry; the
+    /// recipient and amount are fixed by the hook, and a still-refused transfer reverts without change.
+    function claimPayout(address recipient) external nonReentrant {
+        if (unclaimedPayout[recipient] == 0) revert NothingToClaim();
+        _unlock(abi.encode(recipient));
+    }
+
+    function unlockCallback(bytes calldata data) external onlyPoolManager returns (bytes memory) {
         if (!unlocking) revert UnexpectedUnlock();
         unlocking = false;
-        _settleRound();
+        if (data.length == 0) {
+            _settleRound();
+        } else {
+            address recipient = abi.decode(data, (address));
+            uint256 amount = unclaimedPayout[recipient];
+            unclaimedPayout[recipient] = 0;
+            totalUnclaimedPayouts -= amount;
+            emit PayoutClaimed(recipient, amount);
+            _redeemClaim(recipient, amount);
+        }
         return "";
+    }
+
+    /// @notice Burns the hook's IMD claim and transfers it. Only this hook may call it, inside its own
+    /// try/catch: a refused transfer reverts here and is parked by the caller instead of blocking it.
+    function redeemClaim(address recipient, uint256 amount) external {
+        if (msg.sender != address(this)) revert OnlySelf();
+        _redeemClaim(recipient, amount);
+    }
+
+    function _redeemClaim(address recipient, uint256 amount) private {
+        poolManager.burn(address(this), quoteCurrency.toId(), amount);
+        poolManager.take(quoteCurrency, recipient, amount);
+    }
+
+    function _unlock(bytes memory data) private {
+        unlocking = true;
+        bytes memory result = poolManager.unlock(data);
+        if (unlocking || result.length != 0) revert UnexpectedUnlock();
     }
 
     function _settleRound() private {
@@ -304,10 +351,16 @@ contract RektJackpotHook is CheckedHook, Ownable2Step, ReentrancyGuard, IUnlockC
         _redeemTo(BURN_RECIPIENT, burned);
     }
 
+    /// @dev Pays directly when IMD allows it. Otherwise the amount stays backed by the hook's claim and
+    /// is recorded for `claimPayout`, so a blocked winner, burn sink or creator never freezes the pool.
     function _redeemTo(address recipient, uint256 amount) private {
         if (amount == 0) return;
-        poolManager.burn(address(this), quoteCurrency.toId(), amount);
-        poolManager.take(quoteCurrency, recipient, amount);
+        try this.redeemClaim(recipient, amount) {}
+        catch {
+            unclaimedPayout[recipient] += amount;
+            totalUnclaimedPayouts += amount;
+            emit PayoutParked(recipient, amount);
+        }
     }
 
     function _checkSwap(address sender, PoolKey calldata pool, bytes calldata hookData)
@@ -317,7 +370,6 @@ contract RektJackpotHook is CheckedHook, Ownable2Step, ReentrancyGuard, IUnlockC
     {
         if (!initialized) revert NotInitialized();
         if (PoolId.unwrap(pool.toId()) != PoolId.unwrap(poolId)) revert InvalidPool();
-        if (swapRouter == address(0)) revert RouterNotConfigured();
         if (sender != swapRouter) revert OnlySwapRouter();
         if (hookData.length != 32) revert InvalidBuyer();
         buyer = abi.decode(hookData, (address));

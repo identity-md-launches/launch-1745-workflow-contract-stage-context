@@ -93,7 +93,7 @@ contract RektSwapRouterTest is HookFixture {
     }
 
     function test_emptyPoolCannotChargeOrElectLeader() public {
-        _deploy(true, false, true);
+        _deploy(true, false);
         vm.startPrank(alice);
         quote.approve(address(router), 100 ether);
         vm.expectRevert();
