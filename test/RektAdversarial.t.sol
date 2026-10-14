@@ -16,6 +16,7 @@ import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/src/types/BeforeSwapDelta.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
+import {CustomRevert} from "v4-core/src/libraries/CustomRevert.sol";
 
 /// @dev Keeps calls inside one transaction, including reuse of both unlock callbacks.
 contract RoundTripWallet {
@@ -89,7 +90,7 @@ contract RektAdversarialTest is HookFixture {
         vm.expectRevert(RektJackpotHook.NotInitialized.selector);
         fresh.afterSwap(address(router), key, params, BalanceDelta.wrap(0), abi.encode(alice));
         vm.stopPrank();
-        RektSwapRouter freshRouter = new RektSwapRouter(manager, fresh);
+        RektSwapRouter freshRouter = RektSwapRouter(fresh.swapRouter());
         uint256 balance = quote.balanceOf(alice);
         vm.prank(alice);
         vm.expectRevert(RektJackpotHook.NotInitialized.selector);
@@ -333,6 +334,185 @@ contract RektAdversarialTest is HookFixture {
         assertEq(hook.roundId(), 2);
         assertEq(hook.currentLeader(), address(wallet));
         _assertConservation();
+    }
+
+    function test_routerReplacementMidRoundKeepsStateAndStaleApprovalsCannotBeSpent() public {
+        _buy(alice, 100 ether);
+        uint256 end = hook.roundEndTime();
+        uint256 pot = hook.jackpotPool();
+        RektSwapRouter old = router;
+        // Immutables are part of the runtime code: a router bound to another live hook is refused.
+        address otherRouter = _freshHook().swapRouter();
+        assertTrue(otherRouter.codehash != address(router).codehash);
+        vm.prank(owner);
+        vm.expectRevert(RektJackpotHook.InvalidRouter.selector);
+        hook.configureRouter(otherRouter);
+        // A pending owner has no power until it accepts.
+        vm.prank(owner);
+        hook.transferOwnership(bob);
+        RektSwapRouter copy = new RektSwapRouter(manager, hook);
+        vm.prank(bob);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, bob));
+        hook.configureRouter(address(copy));
+        vm.prank(owner);
+        hook.configureRouter(address(copy));
+        assertEq(hook.swapRouter(), address(copy));
+        // A standing approval on the replaced router cannot be spent: the pull is undone with the swap.
+        vm.startPrank(alice);
+        quote.approve(address(old), 100 ether);
+        uint256 balance = quote.balanceOf(alice);
+        vm.expectPartialRevert(CustomRevert.WrappedError.selector);
+        old.swap(true, -100 ether, 1, _priceLimit(true), block.timestamp);
+        vm.stopPrank();
+        assertEq(quote.balanceOf(alice), balance);
+        assertEq(quote.balanceOf(address(old)), 0);
+        vm.prank(address(old));
+        vm.expectRevert(RektJackpotHook.OnlySwapRouter.selector);
+        hook.payCreatorFee();
+        // The live round continues unchanged through the copy.
+        router = copy;
+        vm.warp(block.timestamp + 200);
+        _buy(bob, 100 ether);
+        assertEq(hook.currentLeader(), bob);
+        assertEq(hook.roundEndTime(), end + 120);
+        assertEq(hook.jackpotPool(), pot + 0.5 ether);
+        assertEq(hook.roundId(), 1);
+        assertEq(quote.balanceOf(owner), 1 ether);
+        _assertConservation();
+    }
+
+    function test_reentrantClaimsDuringPayoutsAreRefusedAndEveryParkedAmountIsPaidOnce() public {
+        quote.blockRecipient(alice);
+        _buy(alice, 100 ether);
+        vm.warp(hook.roundEndTime() + 1);
+        hook.settleRound();
+        uint256 aliceParked = hook.unclaimedPayout(alice);
+        assertEq(aliceParked, 0.3 ether);
+        quote.blockRecipient(bob);
+        _buy(bob, 100 ether);
+        vm.warp(hook.roundEndTime() + 1);
+        hook.settleRound();
+        uint256 bobParked = hook.unclaimedPayout(bob);
+        assertGt(bobParked, 0);
+        quote.blockRecipient(address(0));
+        // From inside alice's payout, the IMD transfer tries to claim bob's parked prize.
+        quote.setReentry(address(hook), abi.encodeCall(hook.claimPayout, (bob)));
+        uint256 aliceBefore = quote.balanceOf(alice);
+        uint256 bobBefore = quote.balanceOf(bob);
+        hook.claimPayout(alice);
+        assertTrue(quote.reentryAttempted());
+        assertFalse(quote.reentrySucceeded(), "a claim must not reenter another claim");
+        assertEq(quote.balanceOf(alice) - aliceBefore, aliceParked);
+        assertEq(quote.balanceOf(bob), bobBefore);
+        assertEq(hook.unclaimedPayout(alice), 0);
+        assertEq(hook.unclaimedPayout(bob), bobParked);
+        assertEq(hook.totalUnclaimedPayouts(), bobParked);
+        _assertConservation();
+        // From inside a settlement's winner transfer, the same attempt is refused too. The stand-in
+        // reenters on every transfer, so it is disarmed while the next round is bought.
+        quote.setReentry(address(0), "");
+        _buy(alice, 100 ether);
+        vm.warp(hook.roundEndTime() + 1);
+        quote.setReentry(address(hook), abi.encodeCall(hook.claimPayout, (bob)));
+        hook.settleRound();
+        assertTrue(quote.reentryAttempted());
+        assertFalse(quote.reentrySucceeded(), "a settlement must not reenter a claim");
+        assertEq(hook.unclaimedPayout(bob), bobParked);
+        assertEq(hook.roundId(), 4);
+        // And a claim cannot settle a round from inside its own transfer.
+        quote.setReentry(address(0), "");
+        _buy(alice, 100 ether);
+        vm.warp(hook.roundEndTime() + 1);
+        quote.setReentry(address(hook), abi.encodeCall(hook.settleRound, ()));
+        hook.claimPayout(bob);
+        assertTrue(quote.reentryAttempted());
+        assertFalse(quote.reentrySucceeded(), "a claim must not reenter settlement");
+        assertEq(quote.balanceOf(bob) - bobBefore, bobParked);
+        assertTrue(hook.canSettle(), "the round is still open for its own settlement");
+        assertEq(hook.totalUnclaimedPayouts(), 0);
+        quote.setReentry(address(0), "");
+        hook.settleRound();
+        _assertConservation();
+    }
+
+    function test_blockedTraderCannotReceiveIMDSoSellsAndRefundsRevertWhileBuysSucceed() public {
+        quote.blockRecipient(alice);
+        (uint256 spent,) = _buy(alice, 10 ether);
+        assertEq(spent, 10 ether);
+        assertEq(hook.currentLeader(), alice);
+        bytes32 beforeState = _snapshot();
+        bool buyDirection = Currency.unwrap(key.currency0) == address(quote);
+        vm.startPrank(alice);
+        token.approve(address(router), 1 ether);
+        vm.expectPartialRevert(CustomRevert.WrappedError.selector);
+        router.swap(!buyDirection, -1 ether, 1, _priceLimit(false), block.timestamp);
+        quote.approve(address(router), 20 ether);
+        vm.expectRevert(abi.encodeWithSignature("Error(string)", "blocked recipient"));
+        router.swap(buyDirection, 1 ether, 20 ether, _priceLimit(true), block.timestamp);
+        vm.stopPrank();
+        assertEq(_snapshot(), beforeState, "a refused swap must leave no trace");
+        assertEq(hook.unclaimedPayout(alice), 0, "a refused swap parks nothing");
+        assertEq(hook.totalUnclaimedPayouts(), 0);
+        _assertConservation();
+    }
+
+    function test_parkedPayoutsStayBackedAfterTheFactoryWithdrawsAllLiquidity() public {
+        quote.blockRecipient(alice);
+        _buy(alice, 100 ether);
+        _sell(bob, 100 ether);
+        vm.warp(hook.roundEndTime() + 1);
+        hook.settleRound();
+        uint256 parked = hook.unclaimedPayout(alice);
+        assertGt(parked, 0);
+        factory.modify(key, LOWER, UPPER, 0);
+        factory.modify(key, LOWER, UPPER, -int256(LIQUIDITY));
+        uint256 claims = manager.balanceOf(address(hook), hook.quoteCurrency().toId());
+        assertEq(claims, hook.jackpotPool() + parked);
+        assertGe(quote.balanceOf(address(manager)), claims, "the manager must still hold what the hook owes");
+        vm.expectPartialRevert(CustomRevert.WrappedError.selector);
+        hook.claimPayout(alice);
+        assertEq(hook.unclaimedPayout(alice), parked);
+        quote.blockRecipient(address(0));
+        uint256 before = quote.balanceOf(alice);
+        hook.claimPayout(alice);
+        assertEq(quote.balanceOf(alice) - before, parked);
+        assertEq(hook.totalUnclaimedPayouts(), 0);
+        _assertConservation();
+    }
+
+    /// forge-config: default.fuzz.runs = 500
+    function testFuzz_minimumTicketViewPredictsTheJudgmentBeforeAndAfterExpiry(uint256 seed, uint8 buys) public {
+        uint256 amount = bound(seed, 1 ether, 20_000 ether);
+        uint256 count = bound(uint256(buys), 1, 3);
+        for (uint256 i; i < count; ++i) {
+            _buy(alice, amount);
+        }
+        // Live round: the view is the exact threshold the next buy is judged by.
+        uint256 ticket = hook.minimumTicket();
+        assertEq(ticket, _max(1 ether, (hook.jackpotPool() + 19) / 20));
+        _buy(bob, ticket - 1);
+        assertEq(hook.currentLeader(), alice, "one wei under the ticket must not lead");
+        ticket = hook.minimumTicket();
+        _buy(bob, ticket);
+        assertEq(hook.currentLeader(), bob, "exactly the ticket must lead");
+        // Expired round: the view already reflects the settlement the next swap performs first.
+        vm.warp(hook.roundEndTime() + 1);
+        uint256 potBefore = hook.jackpotPool();
+        ticket = hook.minimumTicket();
+        assertLe(ticket, _max(1 ether, (potBefore + 19) / 20));
+        _buy(alice, ticket - 1);
+        assertEq(hook.roundId(), 2);
+        assertEq(hook.currentLeader(), address(0), "one wei under the post-settlement ticket must not lead");
+        uint256 next = hook.minimumTicket();
+        assertGe(next, ticket);
+        _buy(alice, next);
+        assertEq(hook.currentLeader(), alice);
+        assertEq(hook.roundId(), 2);
+        _assertConservation();
+    }
+
+    function _max(uint256 a, uint256 b) private pure returns (uint256) {
+        return a > b ? a : b;
     }
 
     function _freshHook() private returns (RektJackpotHook fresh) {
